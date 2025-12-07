@@ -42,6 +42,13 @@ export async function runSeparation(provider:string, file:File){
   const chunkSize = hop*(dimT-1)
   const segStep = chunkSize - nfft
   const win = hann(nfft)
+  const fadeIn = new Float32Array(nfft)
+  const fadeOut = new Float32Array(nfft)
+  for(let i=0;i<nfft;i++){
+    const w = 0.5*(1 - Math.cos(Math.PI * i / (nfft-1)))
+    fadeIn[i] = w
+    fadeOut[i] = 1 - w
+  }
 
   start('loadModel')
   const modelResp = await fetch('/models/UVR-MDX-NET-Inst_HQ_3.onnx')
@@ -116,11 +123,12 @@ export async function runSeparation(provider:string, file:File){
   let runTotal = 0
   const tAllStart = (performance?.now?.()||Date.now())
   for(let pos=0; pos<totalLen; pos+=segStep){
-    const segL = new Float32Array(chunkSize)
-    const segR = new Float32Array(chunkSize)
-    const segLen = Math.min(totalLen - pos, chunkSize)
-    segL.set(chL.subarray(pos, pos+segLen))
-    segR.set(chR.subarray(pos, pos+segLen))
+    const segExt = chunkSize + nfft
+    const segLenExt = Math.min(totalLen - pos, segExt)
+    const segL = new Float32Array(segExt)
+    const segR = new Float32Array(segExt)
+    segL.set(chL.subarray(pos, pos+segLenExt))
+    segR.set(chR.subarray(pos, pos+segLenExt))
 
     const frames = new Float32Array(4*dimF*dimT)
     const tStftStart = (performance?.now?.()||Date.now())
@@ -165,9 +173,9 @@ export async function runSeparation(provider:string, file:File){
     const arrOut = (outMap as any)[firstKey].data as Float32Array
     const spec = arrOut.length===4*dimF*dimT ? arrOut : frames
 
-    const segOutL = new Float32Array(chunkSize)
-    const segOutR = new Float32Array(chunkSize)
-    const segNorm = new Float32Array(chunkSize)
+    const segOutL = new Float32Array(segExt)
+    const segOutR = new Float32Array(segExt)
+    const segNorm = new Float32Array(segExt)
     const tIstftStart = (performance?.now?.()||Date.now())
     for(let t=0;t<dimT;t++){
       const start = t*hop
@@ -191,17 +199,54 @@ export async function runSeparation(provider:string, file:File){
       }
     }
     istftTotal += ((performance?.now?.()||Date.now()) - tIstftStart)
-    for(let i=0;i<segLen;i++){
+    for(let i=0;i<segLenExt;i++){
       const d = segNorm[i]
       if(d>1e-12){
         segOutL[i] /= d
         segOutR[i] /= d
       }
     }
-    for(let i=0;i<segLen;i++){
-      outL[pos+i] += segOutL[i]
-      outR[pos+i] += segOutR[i]
-      norm[pos+i] += 1
+    const nextPos = pos + segStep
+    const isFirst = pos===0
+    const isLast = nextPos >= totalLen
+    const writeMax = Math.min(chunkSize, segLenExt)
+    const bodyStart = isFirst ? 0 : Math.min(nfft, writeMax)
+    for(let i=0;i<bodyStart;i++){
+      const idx = pos + i
+      if (idx>=totalLen) break
+      const w = isFirst ? 1 : fadeIn[i]
+      outL[idx] += segOutL[i]*w
+      outR[idx] += segOutR[i]*w
+      norm[idx] += w
+    }
+    for(let i=bodyStart;i<Math.min(segStep, writeMax);i++){
+      const idx = pos + i
+      if (idx>=totalLen) break
+      const w = 1
+      outL[idx] += segOutL[i]*w
+      outR[idx] += segOutR[i]*w
+      norm[idx] += w
+    }
+    if (!isLast){
+      const tailLen = Math.min(nfft, Math.max(0, writeMax - segStep))
+      for(let j=0;j<tailLen;j++){
+        const i = segStep + j
+        const idx = pos + i
+        if (idx>=totalLen) break
+        const w = fadeOut[j]
+        outL[idx] += segOutL[i]*w
+        outR[idx] += segOutR[i]*w
+        norm[idx] += w
+      }
+    } else {
+      for(let i=segStep;i<writeMax;i++){
+        const idx = pos + i
+        if (idx>=totalLen) break
+        const w = 1
+        outL[idx] += segOutL[i]*w
+        outR[idx] += segOutR[i]*w
+        norm[idx] += w
+      }
     }
     segCount++
   }
@@ -209,7 +254,7 @@ export async function runSeparation(provider:string, file:File){
 
   for(let i=0;i<totalLen;i++){
     const d = norm[i]
-    if(d>0){
+    if(d>1e-12){
       outL[i] /= d
       outR[i] /= d
     }
