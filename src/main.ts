@@ -3,12 +3,13 @@ import './ort-config'
 import { runSeparationUI } from './ui'
 
 document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
-  <h1>人声分离（浏览器端，WASM/WebGPU）</h1>
+  <h1>人声分离（浏览器端，WASM/WebGPU/WebGL）</h1>
   <div class="row">
     <label>执行后端</label>
     <select id="provider">
       <option value="wasm">WASM</option>
       <option value="webgpu">WebGPU</option>
+      <option value="webgl">WebGL</option>
     </select>
   </div>
   <div class="row">
@@ -71,11 +72,23 @@ async function detectWebGPUAndUpdateUI(){
   const ortWebgpu = !!(ortAny && typeof ortAny.InferenceSession?.create === 'function')
   lines.push('ort.webgpu='+ortWebgpu)
   if (pre) pre.textContent = lines.join('\n')
+  const optGpu = sel?.querySelector('option[value="webgpu"]') as HTMLOptionElement
   if (!adapterOk){
-    const opt = sel?.querySelector('option[value="webgpu"]') as HTMLOptionElement
-    if (opt) opt.disabled = true
-    if (sel) sel.value = 'wasm'
+    if (optGpu) optGpu.disabled = true
+  } else {
+    if (sel) sel.value = 'webgpu'
   }
+  const optGl = sel?.querySelector('option[value="webgl"]') as HTMLOptionElement
+  try{
+    const hasDoc = typeof (globalThis as any).document !== 'undefined'
+    let glOk = false
+    if (hasDoc){
+      const canvas = (globalThis as any).document.createElement('canvas')
+      const gl = canvas.getContext('webgl2') || canvas.getContext('webgl')
+      glOk = !!gl
+    }
+    if (!glOk && optGl) optGl.disabled = true
+  }catch{}
 }
 
 detectWebGPUAndUpdateUI()

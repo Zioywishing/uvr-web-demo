@@ -1,4 +1,3 @@
-import '/public/vendor/kissfft/lib/kissfft.mjs'
 declare const __kissfft_api__: any
 // @ts-expect-error external public module resolution via global mapping in vite config
 import { rfft, irfft } from '/public/vendor/kissfft/lib/api.js'
@@ -35,8 +34,8 @@ export async function runSeparation(provider:string, file:File){
     const src = offline.createBufferSource(); src.buffer = audioBuf; src.connect(offline.destination); src.start(); buf = await offline.startRendering()
     end('resample44100'); didResample = true
   }
-  const chL = buf.numberOfChannels>0 ? buf.getChannelData(0) : new Float32Array(buf.length)
-  const chR = buf.numberOfChannels>1 ? buf.getChannelData(1) : chL
+  let chL = buf.numberOfChannels>0 ? buf.getChannelData(0) : new Float32Array(buf.length)
+  let chR = buf.numberOfChannels>1 ? buf.getChannelData(1) : chL
 
   const dimF=3072, dimT=256, nfft=6144, hop=1024
   const chunkSize = hop*(dimT-1)
@@ -79,6 +78,25 @@ export async function runSeparation(provider:string, file:File){
     }
   }
 
+  if(provider==='webgl'){
+    try{
+      let webglOk = false
+      const hasDoc = typeof (globalThis as any).document !== 'undefined'
+      if (hasDoc){
+        const canvas = (globalThis as any).document.createElement('canvas')
+        const gl = canvas.getContext('webgl2') || canvas.getContext('webgl')
+        webglOk = !!gl
+      }
+      if(!webglOk){
+        providerUsed = 'wasm'
+        fallbackReason = 'webgl 不可用，回退 wasm'
+      }
+    }catch(e:any){
+      providerUsed = 'wasm'
+      fallbackReason = 'webgl 预检查失败: '+(e?.message||e)
+    }
+  }
+
   if(providerUsed==='webgpu'){
     try{
       start('webgpuInit')
@@ -96,14 +114,19 @@ export async function runSeparation(provider:string, file:File){
     }
   }
 
+  start('kissfftInit')
+  const kissPath = '/public/vendor/kissfft/lib/kissfft.mjs' as string
+  await import(kissPath)
+  end('kissfftInit')
+
   start('createSession')
   let session: any
   try{
     session = await ortAny.InferenceSession.create(modelBuf, { executionProviders:[providerUsed] })
   }catch(e:any){
-    if (providerUsed==='webgpu'){
+    if (providerUsed!=='wasm'){
+      fallbackReason = providerUsed+' session.create 失败: '+(e?.message||e)
       providerUsed = 'wasm'
-      fallbackReason = 'webgpu session.create 失败: '+(e?.message||e)
       session = await ortAny.InferenceSession.create(modelBuf, { executionProviders:[providerUsed] })
     }else{
       throw e
@@ -112,6 +135,16 @@ export async function runSeparation(provider:string, file:File){
   end('createSession')
   const inputName = session.inputNames ? session.inputNames[0] : 'input'
 
+  const sr = 44100
+  const padSamples = Math.max(0, Math.floor(0.4 * sr))
+  if (padSamples > 0){
+    const lPad = new Float32Array(padSamples + chL.length)
+    const rPad = new Float32Array(padSamples + chR.length)
+    lPad.set(chL, padSamples)
+    rPad.set(chR, padSamples)
+    chL = lPad
+    chR = rPad
+  }
   const totalLen = chL.length
   const outL = new Float32Array(totalLen)
   const outR = new Float32Array(totalLen)
@@ -122,6 +155,7 @@ export async function runSeparation(provider:string, file:File){
   let istftTotal = 0
   let runTotal = 0
   const tAllStart = (performance?.now?.()||Date.now())
+  const headFadeSamples = Math.min(chunkSize, Math.max(1, Math.floor(0.015*sr)))
   for(let pos=0; pos<totalLen; pos+=segStep){
     const segExt = chunkSize + nfft
     const segLenExt = Math.min(totalLen - pos, segExt)
@@ -159,9 +193,9 @@ export async function runSeparation(provider:string, file:File){
     try{
       outMap = await session.run({[inputName]: inputTensor})
     }catch(e:any){
-      if (providerUsed==='webgpu'){
+      if (providerUsed!=='wasm'){
+        fallbackReason = providerUsed+' session.run 失败: '+(e?.message||e)
         providerUsed = 'wasm'
-        fallbackReason = 'webgpu session.run 失败: '+(e?.message||e)
         session = await ortAny.InferenceSession.create(modelBuf, { executionProviders:[providerUsed] })
         outMap = await session.run({[inputName]: inputTensor})
       }else{
@@ -199,27 +233,27 @@ export async function runSeparation(provider:string, file:File){
       }
     }
     istftTotal += ((performance?.now?.()||Date.now()) - tIstftStart)
+    const dMin = 1e-8
     for(let i=0;i<segLenExt;i++){
       const d = segNorm[i]
-      if(d>1e-12){
-        segOutL[i] /= d
-        segOutR[i] /= d
-      }
+      const dd = d>=dMin ? d : dMin
+      segOutL[i] /= dd
+      segOutR[i] /= dd
     }
     const nextPos = pos + segStep
     const isFirst = pos===0
     const isLast = nextPos >= totalLen
     const writeMax = Math.min(chunkSize, segLenExt)
-    const bodyStart = isFirst ? 0 : Math.min(nfft, writeMax)
-    for(let i=0;i<bodyStart;i++){
+    const headLen = isFirst ? Math.min(headFadeSamples, writeMax) : Math.min(nfft, writeMax)
+    for(let i=0;i<headLen;i++){
       const idx = pos + i
       if (idx>=totalLen) break
-      const w = isFirst ? 1 : fadeIn[i]
+      const w = fadeIn[i]
       outL[idx] += segOutL[i]*w
       outR[idx] += segOutR[i]*w
       norm[idx] += w
     }
-    for(let i=bodyStart;i<Math.min(segStep, writeMax);i++){
+    for(let i=headLen;i<Math.min(segStep, writeMax);i++){
       const idx = pos + i
       if (idx>=totalLen) break
       const w = 1
@@ -266,7 +300,8 @@ export async function runSeparation(provider:string, file:File){
   steps.push({ name:'overallSegments', ms: segCount })
   steps.push({ name:'overallPipeline', ms: tAllMs })
 
-  const interleaved = interleave(outL, outR)
+  const trimStart = padSamples
+  const interleaved = interleave(outL.subarray(trimStart), outR.subarray(trimStart))
   start('wavEncode')
   const int16 = floatTo16BitPCM(interleaved)
   const wavBlob = writeWAVStereoPCM(int16, 44100)
@@ -284,3 +319,4 @@ export async function runSeparation(provider:string, file:File){
   }
   return { url, metrics }
 }
+ 
