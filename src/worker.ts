@@ -4,12 +4,14 @@ import { rfft, irfft } from '/public/vendor/kissfft/lib/api.js'
 
 declare global { interface Window { ort:any } }
 
+let __webgpu_init_promise: Promise<void> | null = null
+
 function hann(n:number){ const w=new Float32Array(n); for(let i=0;i<n;i++) w[i]=0.5*(1-Math.cos((2*Math.PI*i)/(n-1))); return w }
 function interleave(l:Float32Array, r:Float32Array){ const out=new Float32Array(l.length*2); for(let i=0,j=0;i<l.length;i++,j+=2){ out[j]=l[i]; out[j+1]=r[i] } return out }
 function floatTo16BitPCM(float32:Float32Array){ const out=new Int16Array(float32.length); for(let i=0;i<float32.length;i++){ let s=Math.max(-1, Math.min(1, float32[i])); out[i]=s<0?s*0x8000:s*0x7FFF } return out }
 function writeWAVStereoPCM(int16Interleaved:Int16Array, sampleRate=44100){ const blockAlign=4; const byteRate=sampleRate*blockAlign; const dataSize=int16Interleaved.length*2; const buffer=new ArrayBuffer(44+dataSize); const view=new DataView(buffer); const writeStr=(off:number,str:string)=>{ for(let i=0;i<str.length;i++) view.setUint8(off+i, str.charCodeAt(i)) }; writeStr(0,'RIFF'); view.setUint32(4,36+dataSize,true); writeStr(8,'WAVE'); writeStr(12,'fmt '); view.setUint32(16,16,true); view.setUint16(20,1,true); view.setUint16(22,2,true); view.setUint32(24,sampleRate,true); view.setUint32(28,byteRate,true); view.setUint16(32,blockAlign,true); view.setUint16(34,16,true); writeStr(36,'data'); view.setUint32(40,dataSize,true); for(let i=0;i<int16Interleaved.length;i++) view.setInt16(44+2*i, int16Interleaved[i], true); return new Blob([buffer], {type:'audio/wav'}) }
 
-export async function runSeparation(provider:string, file:File){
+export async function runSeparation(provider:string, file:File, modelFile?: string){
   const marks: Record<string, number> = {}
   const steps: { name:string, ms:number }[] = []
   const start = (name:string)=>{ marks[name] = (performance?.now?.()||Date.now()) }
@@ -30,12 +32,15 @@ export async function runSeparation(provider:string, file:File){
   let didResample = false
   if (audioBuf.sampleRate !== 44100){
     start('resample44100')
-    const offline = new OfflineAudioContext(audioBuf.numberOfChannels, Math.round(audioBuf.duration*44100), 44100)
+    const targetFrames = Math.round(audioBuf.length * 44100 / audioBuf.sampleRate)
+    const offline = new OfflineAudioContext(audioBuf.numberOfChannels, targetFrames, 44100)
     const src = offline.createBufferSource(); src.buffer = audioBuf; src.connect(offline.destination); src.start(); buf = await offline.startRendering()
     end('resample44100'); didResample = true
   }
   let chL = buf.numberOfChannels>0 ? buf.getChannelData(0) : new Float32Array(buf.length)
   let chR = buf.numberOfChannels>1 ? buf.getChannelData(1) : chL
+
+  
 
   const dimF=3072, dimT=256, nfft=6144, hop=1024
   const chunkSize = hop*(dimT-1)
@@ -50,7 +55,9 @@ export async function runSeparation(provider:string, file:File){
   }
 
   start('loadModel')
-  const modelResp = await fetch('/models/UVR-MDX-NET-Inst_HQ_3.onnx')
+  const defaultModel = 'UVR-MDX-NET-Inst_HQ_3.onnx'
+  const modelPath = modelFile && modelFile.startsWith('/') ? modelFile : `/models/${modelFile || defaultModel}`
+  const modelResp = await fetch(modelPath)
   if(!modelResp.ok) throw new Error('无法加载本地模型')
   const modelBuf = new Uint8Array(await modelResp.arrayBuffer())
   end('loadModel')
@@ -58,42 +65,28 @@ export async function runSeparation(provider:string, file:File){
   let providerUsed = provider
   let fallbackReason = ''
   if(provider==='webgpu'){
-    try{
-      const nav:any = (globalThis as any).navigator
-      if(!nav || !nav.gpu){
-        providerUsed = 'wasm'
-        fallbackReason = 'navigator.gpu 不可用，直接回退 wasm'
-      }else{
-        start('webgpuAdapter')
-        const adapter = await nav.gpu.requestAdapter()
-        end('webgpuAdapter')
-        if(!adapter){
-          providerUsed = 'wasm'
-          fallbackReason = 'webgpu adapter 获取失败，回退 wasm'
-        }
-      }
-    }catch(e:any){
-      providerUsed = 'wasm'
-      fallbackReason = 'webgpu 预检查失败: '+(e?.message||e)
+    const nav:any = (globalThis as any).navigator
+    if(!nav || !nav.gpu){
+      throw new Error('navigator.gpu 不可用')
+    }
+    start('webgpuAdapter')
+    const adapter = await nav.gpu.requestAdapter()
+    end('webgpuAdapter')
+    if(!adapter){
+      throw new Error('webgpu adapter 获取失败')
     }
   }
 
   if(provider==='webgl'){
-    try{
-      let webglOk = false
-      const hasDoc = typeof (globalThis as any).document !== 'undefined'
-      if (hasDoc){
-        const canvas = (globalThis as any).document.createElement('canvas')
-        const gl = canvas.getContext('webgl2') || canvas.getContext('webgl')
-        webglOk = !!gl
-      }
-      if(!webglOk){
-        providerUsed = 'wasm'
-        fallbackReason = 'webgl 不可用，回退 wasm'
-      }
-    }catch(e:any){
-      providerUsed = 'wasm'
-      fallbackReason = 'webgl 预检查失败: '+(e?.message||e)
+    let webglOk = false
+    const hasDoc = typeof (globalThis as any).document !== 'undefined'
+    if (hasDoc){
+      const canvas = (globalThis as any).document.createElement('canvas')
+      const gl = canvas.getContext('webgl2') || canvas.getContext('webgl')
+      webglOk = !!gl
+    }
+    if(!webglOk){
+      throw new Error('webgl 不可用')
     }
   }
 
@@ -101,16 +94,26 @@ export async function runSeparation(provider:string, file:File){
     try{
       start('webgpuInit')
       const nav:any = (globalThis as any).navigator
-      const adapter = await (ortAny?.env?.webgpu?.adapter || nav?.gpu?.requestAdapter?.())
-      if (!adapter) throw new Error('webgpu adapter 不可用')
-      const device = await adapter.requestDevice?.({ requiredFeatures: Array.from(adapter.features||[]) })
-      ;(ortAny.env.webgpu as any).adapter = adapter
-      ;(ortAny.env.webgpu as any).device = device
-      end('webgpuInit')
+      const envWgpu:any = (ortAny.env.webgpu = (ortAny.env.webgpu || {}))
+      if (envWgpu.device) {
+        end('webgpuInit')
+      } else {
+        if (!__webgpu_init_promise) {
+          __webgpu_init_promise = (async () => {
+            const adapter = await nav?.gpu?.requestAdapter?.()
+            if (!adapter) throw new Error('webgpu adapter 不可用')
+            const device = await adapter.requestDevice?.({ requiredFeatures: Array.from(adapter.features||[]) })
+            // 不要保存 adapter，因为它已经被 consumed 了，防止 ORT 内部复用导致报错
+            // envWgpu.adapter = adapter
+            envWgpu.device = device
+          })()
+        }
+        await __webgpu_init_promise
+        end('webgpuInit')
+      }
     }catch(e:any){
-      providerUsed = 'wasm'
-      fallbackReason = 'webgpu init 失败: '+(e?.message||e)
       steps.push({ name:'webgpuInitError', ms: 0 })
+      throw e
     }
   }
 
@@ -124,13 +127,7 @@ export async function runSeparation(provider:string, file:File){
   try{
     session = await ortAny.InferenceSession.create(modelBuf, { executionProviders:[providerUsed] })
   }catch(e:any){
-    if (providerUsed!=='wasm'){
-      fallbackReason = providerUsed+' session.create 失败: '+(e?.message||e)
-      providerUsed = 'wasm'
-      session = await ortAny.InferenceSession.create(modelBuf, { executionProviders:[providerUsed] })
-    }else{
-      throw e
-    }
+    throw e
   }
   end('createSession')
   const inputName = session.inputNames ? session.inputNames[0] : 'input'
@@ -193,14 +190,7 @@ export async function runSeparation(provider:string, file:File){
     try{
       outMap = await session.run({[inputName]: inputTensor})
     }catch(e:any){
-      if (providerUsed!=='wasm'){
-        fallbackReason = providerUsed+' session.run 失败: '+(e?.message||e)
-        providerUsed = 'wasm'
-        session = await ortAny.InferenceSession.create(modelBuf, { executionProviders:[providerUsed] })
-        outMap = await session.run({[inputName]: inputTensor})
-      }else{
-        throw e
-      }
+      throw e
     }
     runTotal += ((performance?.now?.()||Date.now()) - tRunStart)
     const firstKey = Object.keys(outMap)[0]
@@ -315,7 +305,12 @@ export async function runSeparation(provider:string, file:File){
     segmentCount: segCount,
     sampleRate: 44100,
     inputDurationSec: buf.duration,
-    didResample
+    outputDurationSec: interleaved.length / 2 / 44100,
+    didResample,
+    inputSampleFrames: buf.length,
+    outputSampleFrames: interleaved.length / 2,
+    padSamples,
+    trimStartSamples: trimStart
   }
   return { url, metrics }
 }

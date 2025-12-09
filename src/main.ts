@@ -13,8 +13,8 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
     </select>
   </div>
   <div class="row">
-    <label>模型文件（已内置）</label>
-    <input id="model" type="file" accept=".onnx" disabled />
+    <label>选择内置模型</label>
+    <select id="modelSel"></select>
   </div>
   <div class="row">
     <label>选择音频文件</label>
@@ -35,6 +35,12 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
     <label>结果试听/下载</label>
     <audio id="outAudio" controls></audio>
     <div><a id="downloadLink" download="instrumental.wav">下载WAV</a></div>
+  </div>
+  <div class="row">
+    <label>混合播放</label>
+    <input id="mixRatio" type="range" min="0" max="100" value="100" />
+    <span id="mixRatioText">100%</span>
+    <audio id="origAudio" preload="auto" style="display:none"></audio>
   </div>
 `
 
