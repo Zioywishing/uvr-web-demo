@@ -42,7 +42,32 @@ export async function runSeparation(provider:string, file:File, modelFile?: stri
 
   
 
-  const dimF=3072, dimT=256, nfft=6144, hop=1024
+  start('loadModel')
+  const defaultModel = 'UVR-MDX-NET-Inst_HQ_3.onnx'
+  const modelName = modelFile || defaultModel
+  const modelPath = modelFile && modelFile.startsWith('/') ? modelFile : `/models/${modelName}`
+  const modelResp = await fetch(modelPath)
+  if(!modelResp.ok) throw new Error('无法加载本地模型')
+  const modelBuf = new Uint8Array(await modelResp.arrayBuffer())
+  end('loadModel')
+
+  // Determine model parameters based on name or defaults
+  // MDX-Net standard: dimF=2048, nfft=4096
+  // MDX-Net HQ: dimF=3072, nfft=6144
+  // Default to HQ (3072) if name contains HQ, otherwise 2048, but respect current default.
+  // We can also use specific mapping if needed.
+  let dimF=3072, dimT=256, nfft=6144, hop=1024
+  
+  // Heuristic: if filename implies non-HQ or specific 2048 models
+  // The user reported UVR_MDXNET_3_9662.onnx expects 2048.
+  // UVR-MDX-NET-Inst_HQ_3.onnx works with 3072.
+  if (modelName.includes('9662') || modelName.includes('Inst_3') && !modelName.includes('HQ') || modelName.includes('KARA') || modelName.includes('Kim_Inst')) {
+     dimF = 2048
+     nfft = 4096
+  }
+  // If explicitly requested 2048 via some other means, or we can catch the error later? 
+  // For now, heuristic based on name is safest without metadata inspection.
+  
   const chunkSize = hop*(dimT-1)
   const segStep = chunkSize - nfft
   const win = hann(nfft)
@@ -53,14 +78,6 @@ export async function runSeparation(provider:string, file:File, modelFile?: stri
     fadeIn[i] = w
     fadeOut[i] = 1 - w
   }
-
-  start('loadModel')
-  const defaultModel = 'UVR-MDX-NET-Inst_HQ_3.onnx'
-  const modelPath = modelFile && modelFile.startsWith('/') ? modelFile : `/models/${modelFile || defaultModel}`
-  const modelResp = await fetch(modelPath)
-  if(!modelResp.ok) throw new Error('无法加载本地模型')
-  const modelBuf = new Uint8Array(await modelResp.arrayBuffer())
-  end('loadModel')
 
   let providerUsed = provider
   let fallbackReason = ''
