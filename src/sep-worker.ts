@@ -1,9 +1,15 @@
 
+import ortWasmSimdThreadedUrl from './lib/ort/ort-wasm-simd-threaded.wasm?url';
+import ortWasmSimdThreadedJsepUrl from './lib/ort/ort-wasm-simd-threaded.jsep.wasm?url';
+import ortWasmSimdThreadedJsepMjsContent from './lib/ort/ort-wasm-simd-threaded.jsep.mjs?raw';
+
+// Create Blob URL for the MJS file to avoid fetch errors
+const ortWasmSimdThreadedJsepMjsUrl = URL.createObjectURL(new Blob([ortWasmSimdThreadedJsepMjsContent], { type: 'application/javascript' }));
+
 // Variables to hold imported modules
 let ORT: any;
 let ort: any;
 let rfft: any, irfft: any;
-let ortWasmBase64: string;
 
 // Initialization Promise
 const initPromise = (async () => {
@@ -17,16 +23,14 @@ const initPromise = (async () => {
         rfft = kissModule.rfft;
         irfft = kissModule.irfft;
 
-        const wasmModule = await import('./ort-wasm-data');
-        ortWasmBase64 = wasmModule.ortWasmBase64;
-
         // Initialize ORT WASM
         if (ort.env && ort.env.wasm) {
-            const wasmUrl = base64ToBlobUrl(ortWasmBase64, 'application/wasm');
             ort.env.wasm.wasmPaths = {
-                'ort-wasm-simd-threaded.wasm': wasmUrl,
-                'ort-wasm-simd.wasm': wasmUrl, 
-                'ort-wasm.wasm': wasmUrl 
+                'mjs': ortWasmSimdThreadedJsepMjsUrl,
+                'wasm': ortWasmSimdThreadedJsepUrl,
+                'ort-wasm-simd-threaded.wasm': ortWasmSimdThreadedUrl,
+                'ort-wasm-simd-threaded.jsep.wasm': ortWasmSimdThreadedJsepUrl,
+                'ort-wasm-simd-threaded.jsep.mjs': ortWasmSimdThreadedJsepMjsUrl
             };
             ort.env.wasm.numThreads = 1; 
         }
@@ -39,18 +43,6 @@ const initPromise = (async () => {
         throw e; // Re-throw to ensure await initPromise fails
     }
 })();
-
-// Helper to create Blob URL from Base64
-function base64ToBlobUrl(base64: string, type: string) {
-    const binStr = atob(base64);
-    const len = binStr.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-        bytes[i] = binStr.charCodeAt(i);
-    }
-    const blob = new Blob([bytes], { type });
-    return URL.createObjectURL(blob);
-}
 
 declare global {
     interface Window {
@@ -193,11 +185,14 @@ async function runSeparationInner(inputData: RunData) {
     // In worker, we can use fetch.
     const modelPath = modelName.startsWith('/') || modelName.startsWith('http') ? modelName : `/models/${modelName}`
     
-    // Check if modelFile is actually an ArrayBuffer (if we decide to pass buffer)
-    // For now assume string path.
-    const modelResp = await fetch(modelPath)
-    if (!modelResp.ok) throw new Error('无法加载本地模型')
-    const modelBuf = new Uint8Array(await modelResp.arrayBuffer())
+    // Optimized loading: check for LFS pointer and pass path directly to ORT
+    // We fetch a small chunk first to check if it's a Git LFS pointer
+    const headResp = await fetch(modelPath, { headers: { Range: 'bytes=0-100' } });
+    const headText = await headResp.text();
+    if (headText.includes('version https://git-lfs.github.com/spec/v1')) {
+        throw new Error(`模型文件 "${modelName}" 尚未下载 (Git LFS 指针)。请在项目根目录运行 "git lfs pull" 以获取真实模型文件。`);
+    }
+
     end('loadModel')
 
     let dimF = 3072,
@@ -282,7 +277,7 @@ async function runSeparationInner(inputData: RunData) {
     start('createSession')
     let session: any
     try {
-        session = await ort.InferenceSession.create(modelBuf, {
+        session = await ort.InferenceSession.create(modelPath, {
             executionProviders: [providerUsed]
         })
     } catch (e: any) {
