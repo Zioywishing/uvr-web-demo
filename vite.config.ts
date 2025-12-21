@@ -6,5 +6,8 @@ export default defineConfig({
   server: {
     https: true,
     host: true
+  },
+  worker: {
+    format: 'es'
   }
 })

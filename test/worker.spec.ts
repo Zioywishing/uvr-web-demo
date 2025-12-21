@@ -9,15 +9,7 @@ describe('runSeparation smoke', () => {
     const fs = await import('node:fs')
     const resolve = path.resolve
 
-    ;(globalThis as any).Module = {
-      locateFile: (p:string)=> resolve(__dirname, '../public/vendor/kissfft/lib/', p),
-      wasmBinary: fs.readFileSync(resolve(__dirname, '../public/vendor/kissfft/lib/kissfft.wasm')),
-    }
     ;(globalThis as any).fetch = async (url:string)=>{
-      if (url.endsWith('kissfft.wasm') || url.includes('/public/vendor/kissfft/lib/kissfft.wasm')){
-        const data = fs.readFileSync(resolve(__dirname, '../public/vendor/kissfft/lib/kissfft.wasm'))
-        return { ok:true, arrayBuffer: async()=> new Uint8Array(data).buffer } as any
-      }
       if (url.includes('/models/UVR-MDX-NET-Inst_HQ_3.onnx')){
         const data = fs.readFileSync(resolve(__dirname, '../public/models/UVR-MDX-NET-Inst_HQ_3.onnx'))
         return { ok:true, arrayBuffer: async()=> new Uint8Array(data).buffer } as any
@@ -72,7 +64,7 @@ describe('runSeparation smoke', () => {
       }
     } as any
 
-    await import('../public/vendor/kissfft/lib/kissfft.mjs')
+    await import('../src/lib/kissfft/lib/kissfft.mjs')
     const mod = await import('../src/worker')
     runSeparation = mod.runSeparation
   })

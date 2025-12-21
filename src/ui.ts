@@ -4,7 +4,25 @@ import { Howl } from 'howler'
 export function runSeparationUI(){
   const logEl = document.getElementById('log') as HTMLPreElement
   const btn = document.getElementById('run') as HTMLButtonElement
-  function log(m:string){ logEl.textContent += m+'\n'; logEl.scrollTop = logEl.scrollHeight }
+  let lastLogWasProgress = false;
+  function log(m:string){ 
+      lastLogWasProgress = false;
+      logEl.textContent += m+'\n'; 
+      logEl.scrollTop = logEl.scrollHeight 
+  }
+  function updateProgress(p: number) {
+      const msg = `Progress: ${p}%`;
+      if (lastLogWasProgress) {
+           let text = logEl.textContent || '';
+           const effectiveEnd = text.endsWith('\n') ? text.length - 1 : text.length;
+           const lastLineStart = text.lastIndexOf('\n', effectiveEnd - 1) + 1;
+           logEl.textContent = text.substring(0, lastLineStart) + msg + '\n';
+      } else {
+          logEl.textContent += msg + '\n';
+      }
+      lastLogWasProgress = true;
+      logEl.scrollTop = logEl.scrollHeight;
+  }
   const modelSel = document.getElementById('modelSel') as HTMLSelectElement
   const defaultModel = 'UVR-MDX-NET-Inst_HQ_3.onnx'
   const outAudio = document.getElementById('outAudio') as HTMLAudioElement
@@ -88,7 +106,7 @@ export function runSeparationUI(){
     try{
       log('开始运行...')
       const chosenModel = modelSel?.value || defaultModel
-      const { url, metrics } = await runSeparation(provider, audioFile, chosenModel)
+      const { url, metrics } = await runSeparation(provider, audioFile, chosenModel, updateProgress)
       outAudio.src = url
       const origUrl = URL.createObjectURL(audioFile)
       origAudio.src = origUrl
@@ -107,7 +125,7 @@ export function runSeparationUI(){
       log('完成，生成WAV可试听/下载')
       if (metrics){
         const gpuEl = document.getElementById('gpu') as HTMLPreElement
-        const lines = metrics.steps.map(s=> `${s.name}: ${s.ms.toFixed ? s.ms.toFixed(2)+'ms' : String(s.ms)}`)
+        const lines = metrics.steps.map((s: any)=> `${s.name}: ${s.ms.toFixed ? s.ms.toFixed(2)+'ms' : String(s.ms)}`)
         lines.unshift(`provider: ${metrics.providerUsed} (requested: ${metrics.providerRequested})`)
         if (metrics.fallbackReason) lines.unshift(`fallback: ${metrics.fallbackReason}`)
         lines.push(`segments: ${metrics.segmentCount}`)
