@@ -1,5 +1,7 @@
-import { runSeparation } from './worker'
+import { runSeparation, startStreamSeparation, decodeAudioFile } from './worker'
+import { StreamPlayer } from './stream-player'
 import { Howl } from 'howler'
+import { interleave, floatTo16BitPCM, writeWAVStereoPCM } from './wav-utils'
 
 export function runSeparationUI(){
   const logEl = document.getElementById('log') as HTMLPreElement
@@ -102,7 +104,166 @@ export function runSeparationUI(){
   btn.addEventListener('click', async ()=>{
     const provider = (document.getElementById('provider') as HTMLSelectElement).value
     const audioFile = (document.getElementById('audio') as HTMLInputElement).files?.[0]
+    const streamMode = (document.getElementById('streamMode') as HTMLInputElement).checked;
+
     if(!audioFile){ log('请先选择音频文件'); return }
+
+    if (streamMode) {
+        // Streaming Mode
+        let stream: ReturnType<typeof startStreamSeparation> | undefined;
+        try {
+            btn.disabled = true;
+            log('模式: 流式播放 (边分离边听)');
+            log('正在解码音频...');
+            const chosenModel = modelSel?.value || defaultModel;
+            const decoded = await decodeAudioFile(audioFile);
+            log(`解码完成 (时长: ${decoded.duration.toFixed(2)}s)`);
+
+            const streamPlayer = new StreamPlayer();
+            // Store streamPlayer globally or on window to prevent GC
+            (window as any).__streamPlayer = streamPlayer;
+            
+            const accumulatedL: Float32Array[] = [];
+            const accumulatedR: Float32Array[] = [];
+            let totalSamples = 0;
+
+            const onEnd = (error?: string) => {
+                 if (error) {
+                     log('流式处理出错: ' + error);
+                     stream?.terminate();
+                     btn.disabled = false;
+                     return;
+                 }
+
+                 log('流式处理完成');
+                 stream?.terminate();
+                 
+                 // Generate WAV asynchronously to avoid blocking UI/Audio
+                 setTimeout(() => {
+                    try {
+                        if (totalSamples === 0) {
+                            log('警告: 没有生成音频数据');
+                            btn.disabled = false;
+                            return;
+                        }
+
+                        // Merge chunks
+                        const finalL = new Float32Array(totalSamples);
+                        const finalR = new Float32Array(totalSamples);
+                        let offset = 0;
+                        for (let i = 0; i < accumulatedL.length; i++) {
+                            finalL.set(accumulatedL[i], offset);
+                            finalR.set(accumulatedR[i], offset);
+                            offset += accumulatedL[i].length;
+                        }
+                        
+                        // Generate WAV
+                        const interleaved = interleave(finalL, finalR);
+                        const pcm = floatTo16BitPCM(interleaved);
+                        const blob = writeWAVStereoPCM(pcm, 44100);
+                        const url = URL.createObjectURL(blob);
+                        
+                        // Setup Download Link
+                        const a = document.getElementById('downloadLink') as HTMLAnchorElement;
+                        a.href = url; 
+                        a.download = 'instrumental.wav';
+                        log('生成WAV可下载 (点击下方链接)');
+
+                        // Delay switching playback source until stream playback is likely done
+                        // Or just set it but don't autoplay.
+                        // Ideally we should wait for streamPlayer to finish.
+                        // For now, we update the UI elements but don't stop streamPlayer.
+                        
+                        outAudio.src = url;
+                        const origUrl = URL.createObjectURL(audioFile);
+                        origAudio.src = origUrl;
+                        
+                        try{ outHowl?.unload() }catch{}
+                        try{ origHowl?.unload() }catch{}
+                        outHowl = new Howl({ src:[url], html5:false, preload:true, format:['wav'] });
+                        
+                        const ext = (audioFile.name||'').split('.').pop()?.toLowerCase();
+                        if (ext){
+                            origHowl = new Howl({ src:[origUrl], html5:false, preload:true, format:[ext] });
+                        } else {
+                            origHowl = new Howl({ src:[origUrl], html5:false, preload:true });
+                        }
+                        
+                        updateMix();
+                        
+                        // Log durations
+                        const logDurations = ()=>{
+                            const o1 = Number.isFinite(outAudio.duration) ? outAudio.duration : NaN
+                            const o2 = Number.isFinite(origAudio.duration) ? origAudio.duration : NaN
+                            const parts: string[] = []
+                            if (!Number.isNaN(o1)) parts.push(`outAudio.duration=${o1.toFixed(3)}s`)
+                            if (!Number.isNaN(o2)) parts.push(`origAudio.duration=${o2.toFixed(3)}s`)
+                            if (parts.length){
+                            log('播放时长\n'+parts.join('\n'))
+                            }
+                        }
+                        outAudio.addEventListener('loadedmetadata', logDurations, { once: true })
+                        origAudio.addEventListener('loadedmetadata', logDurations, { once: true })
+                    } catch (e: any) {
+                        console.error('Error creating WAV:', e);
+                        log('生成文件失败: ' + e.message);
+                    }
+
+                    btn.disabled = false;
+                 }, 100);
+            };
+
+            stream = startStreamSeparation(provider, chosenModel, (res) => {
+                streamPlayer.push(res.chL, res.chR);
+                accumulatedL.push(res.chL);
+                accumulatedR.push(res.chR);
+                totalSamples += res.chL.length;
+            }, onEnd);
+
+            log('开始流式处理与播放...');
+            
+            // Push chunks as fast as possible (Greedy Processing)
+            const { chL, chR } = decoded;
+            const chunkSize = 22050; // 0.5s
+            const totalLen = chL.length;
+            let offset = 0;
+
+            // Ensure AudioContext is running
+            streamPlayer.resume().catch((e: unknown) => console.error('Failed to resume audio context:', e));
+
+            async function pushNext() {
+                if (offset >= totalLen) {
+                    stream?.stop();
+                    log('流式输入结束，等待处理完成...');
+                    return;
+                }
+
+                // Throttle push: 1 chunk per tick, wait 5ms
+                // This is fast enough (>50x real-time) but avoids message queue overload
+                const chunksPerTick = 1; 
+                for (let i = 0; i < chunksPerTick && offset < totalLen; i++) {
+                    const end = Math.min(offset + chunkSize, totalLen);
+                    const chunkL = chL.slice(offset, end);
+                    const chunkR = chR.slice(offset, end);
+                    
+                    stream?.push(chunkL, chunkR);
+                    offset = end;
+                }
+
+                setTimeout(pushNext, 5); 
+            }
+
+            pushNext();
+
+        } catch (e: any) {
+            console.error(e);
+            log('错误: ' + (e?.message || e));
+            stream?.terminate();
+            btn.disabled = false;
+        }
+        return;
+    }
+
     try{
       log('开始运行...')
       const chosenModel = modelSel?.value || defaultModel

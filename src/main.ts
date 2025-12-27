@@ -22,6 +22,9 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
   </div>
   <div class="row">
     <button id="run">开始分离</button>
+    <label style="margin-left: 10px;">
+        <input type="checkbox" id="streamMode" checked /> 流式播放 (边分离边听)
+    </label>
   </div>
   <div class="row">
     <label>状态</label>
